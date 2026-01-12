@@ -13,3 +13,5 @@
 #newdevc2
 #newdevx3
 #newdevc4
+#newdevc5
+#newdevc6
