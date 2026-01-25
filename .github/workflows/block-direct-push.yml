@@ -25,7 +25,7 @@ jobs:
           echo "Commits:"
           jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
       
-      - name: Detect workflow hehe file changes in this push
+      - name: Detect workflow file changes in this push
         id: detect_files
         run: |
           set -euo pipefail
