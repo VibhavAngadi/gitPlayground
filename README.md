@@ -16,6 +16,4 @@
 #newdevc5
 #newdevc6
 #newcommitfrommain
-hehe. hehe
-hqh 
-qjn
+jkdnc
