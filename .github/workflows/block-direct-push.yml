@@ -11,6 +11,10 @@ permissions:
 jobs:
   detect-and-revert:
     runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.revert.outputs.should_run || steps.skip.outputs.should_run }}
+      revert_pr_number: ${{ steps.revert.outputs.revert_pr_number }}
+      revert_branch: ${{ steps.revert.outputs.revert_branch }}
     steps:
       - name: Inspect event
         run: |
@@ -35,13 +39,16 @@ jobs:
 
       - name: Abort if this push came from a PR merge (or has associated PR)
         if: ${{ steps.check_pr.outputs.pulls_count != '0' }}
+        id: skip
         run: |
           echo "This commit is associated with a PR (merge). Nothing to do."
+          echo "should_run=false" >> $GITHUB_OUTPUT
       
       - name: Revert direct push (create revert branch and open revert PR)
         if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
+        id: revert
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
           REPO: ${{ github.repository }}
           SHORT_SHA: ${{ github.sha }}
           EVENT_PATH: ${{ github.event_path }}
@@ -52,6 +59,7 @@ jobs:
           commits=$(jq -r '.commits | reverse | .[].id' "$EVENT_PATH")
           if [ -z "${commits}" ]; then
             echo "No commits found in event payload; nothing to revert."
+            echo "should_run=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -60,7 +68,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
 
           # clone full history
-          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" repo
+          git clone "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" repo
           cd repo
           git fetch --all
           git checkout main
@@ -80,15 +88,107 @@ jobs:
             fi
           done
 
-          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+          git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
           # Create PR via API
           title="Revert direct push ${SHORT_SHA::7} to main"
           body="Automated revert PR: this was created because commits were pushed directly to main without a PR. Please review & merge to restore repository state.\n\nDirect push SHA: ${SHORT_SHA}\n\n(If this was a mistaken revert, please investigate.)"
 
-          create_resp=$(curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+          create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/${REPO}/pulls" \
             -d "$(jq -n --arg t "$title" --arg b "$body" --arg h "$BRANCH" '{title:$t, head:$h, base:"main", body:$b}')")
 
           echo "Create PR response:"
           echo "$create_resp" | jq .
+
+          pr_number=$(echo "$create_resp" | jq -r '.number // empty')
+          if [ -z "$pr_number" ]; then
+            echo "Failed to create revert PR."
+            exit 1
+          fi
+
+          echo "revert_pr_number=$pr_number" >> $GITHUB_OUTPUT
+          echo "revert_branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "should_run=true" >> $GITHUB_OUTPUT
+
+  approve-and-reapply:
+    needs: detect-and-revert
+    if: ${{ needs.detect-and-revert.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    environment: revert-approval
+    env:
+      AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
+      REPO: ${{ github.repository }}
+      SHORT_SHA: ${{ github.sha }}
+      EVENT_PATH: ${{ github.event_path }}
+      REVERT_PR_NUMBER: ${{ needs.detect-and-revert.outputs.revert_pr_number }}
+      REVERT_MERGE_METHOD: ${{ vars.REVERT_MERGE_METHOD || 'merge' }}
+    steps:
+      - name: Merge revert PR (after approval)
+        run: |
+          set -euo pipefail
+          if [ -z "${REVERT_PR_NUMBER}" ]; then
+            echo "Missing revert PR number."
+            exit 1
+          fi
+
+          payload=$(jq -n --arg method "$REVERT_MERGE_METHOD" '{merge_method:$method}')
+          resp=$(curl -s -X PUT -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/pulls/${REVERT_PR_NUMBER}/merge" \
+            -d "$payload")
+
+          merged=$(echo "$resp" | jq -r '.merged // false')
+          if [ "$merged" != "true" ]; then
+            echo "Failed to merge revert PR."
+            echo "$resp" | jq .
+            exit 1
+          fi
+
+      - name: Create reapply PR (cherry-pick direct push commits)
+        run: |
+          set -euo pipefail
+          commits=$(jq -r '.commits | .[].id' "$EVENT_PATH")
+          if [ -z "${commits}" ]; then
+            echo "No commits found in event payload; nothing to reapply."
+            exit 0
+          fi
+
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          git clone "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git fetch --all
+          git checkout main
+          git pull --ff-only
+
+          BRANCH="reapply/direct-push-${SHORT_SHA::7}"
+          git checkout -b "$BRANCH"
+
+          for c in $commits; do
+            echo "Cherry-picking commit $c"
+            parents=$(git rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')
+            if [ "$parents" -gt 2 ]; then
+              git cherry-pick -m 1 "$c"
+            else
+              git cherry-pick "$c"
+            fi
+          done
+
+          git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+
+          title="Apply direct push ${SHORT_SHA::7} via PR"
+          body="This PR re-applies commits that were pushed directly to main. It was created automatically after the revert was approved and merged.\n\nOriginal direct push SHA: ${SHORT_SHA}"
+
+          create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/pulls" \
+            -d "$(jq -n --arg t "$title" --arg b "$body" --arg h "$BRANCH" '{title:$t, head:$h, base:"main", body:$b}')")
+
+          echo "Create PR response:"
+          echo "$create_resp" | jq .
+
+          pr_number=$(echo "$create_resp" | jq -r '.number // empty')
+          if [ -z "$pr_number" ]; then
+            echo "Failed to create reapply PR."
+            exit 1
+          fi
