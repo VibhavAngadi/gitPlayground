@@ -77,7 +77,7 @@ jobs:
           BRANCH="revert/direct-push-${SHORT_SHA::7}"
           git checkout -b "$BRANCH"
 
-          # revert each commit in order (newest->oldest)
+          # revert each commit in order (oldest->newest)
           for c in $commits; do
             echo "Reverting commit $c"
             # If a commit fails to revert cleanly we stop so human can inspect
