@@ -54,59 +54,12 @@ jobs:
         id: check_pr
         run: |
           set -euo pipefail
-          commits=$(jq -r '.commits[]?.id' "$GITHUB_EVENT_PATH")
-          if [ -z "$commits" ]; then
-            commits="${GITHUB_SHA}"
-          fi
-          pulls_count=0
-          has_pr=false
-
-          # Use GraphQL associatedPullRequests (more reliable for squash/rebase/merge)
-          owner="${REPO%%/*}"
-          repo_name="${REPO#*/}"
-          query="query { repository(owner:\"${owner}\", name:\"${repo_name}\") {"
-          i=0
-          for sha in $commits; do
-            query="${query} c${i}: object(oid:\"${sha}\") { ... on Commit { associatedPullRequests(first: 1) { totalCount } } }"
-            i=$((i+1))
-          done
-          query="${query} } }"
-
-          resp=$(curl -s -H "Authorization: token ${{ github.token }}" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg q "$query" '{query:$q}')" \
-            "${{ env.GITHUB_API }}/graphql")
-
-          for idx in $(seq 0 $((i-1))); do
-            count=$(echo "$resp" | jq -r ".data.repository.c${idx}.associatedPullRequests.totalCount // 0")
-            if [ "$count" -gt 0 ]; then
-              pulls_count=$count
-              has_pr=true
-              break
-            fi
-          done
-
-          # Fallbacks for squash/rebase/merge styles where association may not be returned
-          if [ "$has_pr" = "false" ]; then
-            head_msg=$(jq -r '.head_commit.message // empty' "$GITHUB_EVENT_PATH")
-            if echo "$head_msg" | grep -Eq 'Merge pull request #[0-9]+'; then
-              has_pr=true
-              pulls_count=1
-            elif echo "$head_msg" | grep -Eq '\(#\d+\)'; then
-              has_pr=true
-              pulls_count=1
-            fi
-          fi
-
-          echo "pulls_count=$pulls_count" >> $GITHUB_OUTPUT
-          echo "has_pr=$has_pr" >> $GITHUB_OUTPUT
-
-      - name: Abort if this push came from a PR merge (or has associated PR)
-        if: ${{ steps.check_pr.outputs.pulls_count != '0' }}
-        id: skip
-        run: |
-          echo "This commit is associated with a PR (merge). Nothing to do."
-          echo "should_run=false" >> $GITHUB_OUTPUT
-          echo "touches_workflows=false" >> $GITHUB_OUTPUT
+          resp=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ github.token }}" \
+            "${{ env.GITHUB_API }}/repos/${{ env.REPO }}/commits/${GITHUB_SHA}/pulls")
+          echo "$resp" > pulls.json
+          count=$(jq 'length' pulls.json)
+          echo "pulls_count=$count" >> $GITHUB_OUTPUT
 
       - name: Prepare auth token (ADMIN_PAT preferred when workflows changed)
         id: auth
@@ -122,7 +75,6 @@ jobs:
           echo "auth_token=$AUTH" >> $GITHUB_OUTPUT
 
       - name: Create revert branch & PR (revert direct push)
-        if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
         id: revert
         env:
           AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
@@ -151,10 +103,8 @@ jobs:
             echo "should_run=false" >> $GITHUB_OUTPUT
             exit 0
           fi
-          # Use the latest commit message for the revert PR title
-          latest_commit_message=$(jq -r '.head_commit.message // .commits[-1].message // empty' "$GITHUB_EVENT_PATH" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
 
-          echo "Detected direct push to main (no associated PR). Will create a revert branch and open a PR."
+          echo "Detected update to main. Creating revert branch and opening a PR."
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
@@ -183,11 +133,7 @@ jobs:
           # push revert branch
           git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
-          if [ -n "${latest_commit_message}" ]; then
-            title="${latest_commit_message}"
-          else
-            title="Revert direct push ${SHORT_SHA} to main"
-          fi
+          title="Revert direct push ${SHORT_SHA} to main"
           body="Automated revert PR: created because commits were pushed directly to main without a PR.\n\nDirect push SHA: ${GITHUB_SHA}\n\nPlease review & merge to restore repository state."
 
           create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
@@ -238,8 +184,6 @@ jobs:
           # Read possible step outputs (they exist if the steps ran)
           if [ -n "${{ steps.revert.outputs.should_run || '' }}" ]; then
             should_run="${{ steps.revert.outputs.should_run }}"
-          elif [ -n "${{ steps.skip.outputs.should_run || '' }}" ]; then
-            should_run="${{ steps.skip.outputs.should_run }}"
           fi
 
           revert_pr_number="${{ steps.revert.outputs.revert_pr_number || '' }}"
