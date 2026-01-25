@@ -61,6 +61,14 @@ jobs:
           count=$(jq 'length' pulls.json)
           echo "pulls_count=$count" >> $GITHUB_OUTPUT
 
+      - name: Abort if this push came from a PR merge (or has associated PR)
+        if: ${{ steps.check_pr.outputs.pulls_count != '0' }}
+        id: skip
+        run: |
+          echo "This commit is associated with a PR (merge). Nothing to do."
+          echo "should_run=false" >> $GITHUB_OUTPUT
+          echo "touches_workflows=false" >> $GITHUB_OUTPUT
+
       - name: Prepare auth token (ADMIN_PAT preferred when workflows changed)
         id: auth
         run: |
@@ -75,6 +83,7 @@ jobs:
           echo "auth_token=$AUTH" >> $GITHUB_OUTPUT
 
       - name: Create revert branch & PR (revert direct push)
+        if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
         id: revert
         env:
           AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
@@ -104,7 +113,7 @@ jobs:
             exit 0
           fi
 
-          echo "Detected update to main. Creating revert branch and opening a PR."
+          echo "Detected direct push to main (no associated PR). Will create a revert branch and open a PR."
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
@@ -184,6 +193,8 @@ jobs:
           # Read possible step outputs (they exist if the steps ran)
           if [ -n "${{ steps.revert.outputs.should_run || '' }}" ]; then
             should_run="${{ steps.revert.outputs.should_run }}"
+          elif [ -n "${{ steps.skip.outputs.should_run || '' }}" ]; then
+            should_run="${{ steps.skip.outputs.should_run }}"
           fi
 
           revert_pr_number="${{ steps.revert.outputs.revert_pr_number || '' }}"
