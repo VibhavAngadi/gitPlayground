@@ -15,6 +15,7 @@ permissions:
 
 env:
   REPO: ${{ github.repository }}
+  EVENT_PATH: ${{ github.event_path }}
   GITHUB_API: https://api.github.com
 
 jobs:
@@ -30,16 +31,15 @@ jobs:
         run: |
           echo "PUSH SHA: $GITHUB_SHA"
           echo "Repository: $REPO"
-          echo "Event path: $GITHUB_EVENT_PATH"
+          echo "Event path: $EVENT_PATH"
           echo "Event type: $GITHUB_EVENT_NAME"
           echo "Commits:"
-          jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
+          jq -r '.commits[]? | "\(.id) \(.message)"' "$EVENT_PATH" || true
 
       - name: Get list of files changed in push
         id: detect_files
         run: |
           set -euo pipefail
-          EVENT_PATH="${GITHUB_EVENT_PATH}"
           # Collect changed files across all commits
           files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$EVENT_PATH" 2>/dev/null | sort -u || true)
           echo "FILES<<EOF" >> $GITHUB_OUTPUT
@@ -89,10 +89,10 @@ jobs:
         env:
           AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
           REPO: ${{ env.REPO }}
+          EVENT_PATH: ${{ env.EVENT_PATH }}
           GITHUB_API: ${{ env.GITHUB_API }}
         run: |
           set -euo pipefail
-          EVENT_PATH="${GITHUB_EVENT_PATH}"
 
           # Find changed files again (safer than relying on job output interpolation)
           files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$EVENT_PATH" 2>/dev/null | sort -u || true)
@@ -214,6 +214,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPO: ${{ github.repository }}
+      EVENT_PATH: ${{ github.event_path }}
       GITHUB_API: https://api.github.com
       AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
       REVERT_PR_NUMBER: ${{ needs.detect-and-revert.outputs.revert_pr_number }}
@@ -246,7 +247,6 @@ jobs:
       - name: Reapply commits as a PR (cherry-pick original commits into a PR)
         run: |
           set -euo pipefail
-          EVENT_PATH="${GITHUB_EVENT_PATH}"
 
           if [ "${TOUCHES_WORKFLOWS}" = "true" ] && [ -z "${{ secrets.ADMIN_PAT }}" ]; then
             echo "Reapply would touch .github/workflows/. Set ADMIN_PAT with repo+workflow scopes."
