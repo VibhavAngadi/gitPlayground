@@ -27,7 +27,7 @@ jobs:
       revert_branch: ${{ steps.set_outputs.outputs.revert_branch }}
       touches_workflows: ${{ steps.set_outputs.outputs.touches_workflows }}
     steps:
-      - name: Debug: event & push
+      - name: "Debug: event & push"
         run: |
           echo "PUSH SHA: $GITHUB_SHA"
           echo "Repository: $REPO"
