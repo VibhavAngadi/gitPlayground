@@ -1,5 +1,4 @@
 import java.util.*;
-import java.io.*;
 
 public class onemoew {
     public static void main(String[] args) {
@@ -8,6 +7,5 @@ public class onemoew {
         for (int i = 0; i < n; i++) {
             System.out.println("Hello, World!");
         }
-        System.out.println("This is a new line added.");
     }
 }
