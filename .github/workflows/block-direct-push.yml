@@ -7,7 +7,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  workflows: write
 
 jobs:
   detect-and-revert:
@@ -16,6 +15,7 @@ jobs:
       should_run: ${{ steps.revert.outputs.should_run || steps.skip.outputs.should_run }}
       revert_pr_number: ${{ steps.revert.outputs.revert_pr_number }}
       revert_branch: ${{ steps.revert.outputs.revert_branch }}
+      touches_workflows: ${{ steps.detect_files.outputs.touches_workflows || steps.skip.outputs.touches_workflows }}
     steps:
       - name: Inspect event
         run: |
@@ -24,6 +24,17 @@ jobs:
           echo "Event path: $GITHUB_EVENT_PATH"
           echo "Commits:"
           jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
+      
+      - name: Detect workflow file changes in this push
+        id: detect_files
+        run: |
+          set -euo pipefail
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$GITHUB_EVENT_PATH" | sort -u)
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            echo "touches_workflows=true" >> $GITHUB_OUTPUT
+          else
+            echo "touches_workflows=false" >> $GITHUB_OUTPUT
+          fi
 
       - name: Check whether commit is associated with a PR
         id: check_pr
@@ -44,17 +55,29 @@ jobs:
         run: |
           echo "This commit is associated with a PR (merge). Nothing to do."
           echo "should_run=false" >> $GITHUB_OUTPUT
+          echo "touches_workflows=false" >> $GITHUB_OUTPUT
       
       - name: Revert direct push (create revert branch and open revert PR)
         if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
         id: revert
         env:
+          GITHUB_TOKEN: ${{ github.token }}
+          ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
           AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
           REPO: ${{ github.repository }}
           SHORT_SHA: ${{ github.sha }}
           EVENT_PATH: ${{ github.event_path }}
         run: |
           set -euo pipefail
+          # If workflow files were touched, a PAT with workflow scope is required.
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$EVENT_PATH" | sort -u)
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            if [ -z "${ADMIN_PAT:-}" ]; then
+              echo "Direct push touched .github/workflows/. Set ADMIN_PAT with repo+workflow scopes."
+              exit 1
+            fi
+          fi
+
           # load commits from push event (the event payload has `.commits[]`)
           # Revert newest -> oldest to avoid conflicts when commits touch same lines
           commits=$(jq -r '.commits | reverse | .[].id' "$EVENT_PATH")
@@ -111,6 +134,11 @@ jobs:
           echo "revert_pr_number=$pr_number" >> $GITHUB_OUTPUT
           echo "revert_branch=$BRANCH" >> $GITHUB_OUTPUT
           echo "should_run=true" >> $GITHUB_OUTPUT
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            echo "touches_workflows=true" >> $GITHUB_OUTPUT
+          else
+            echo "touches_workflows=false" >> $GITHUB_OUTPUT
+          fi
 
   approve-and-reapply:
     needs: detect-and-revert
@@ -118,12 +146,15 @@ jobs:
     runs-on: ubuntu-latest
     environment: revert-approval
     env:
+      GITHUB_TOKEN: ${{ github.token }}
+      ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
       AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
       REPO: ${{ github.repository }}
       SHORT_SHA: ${{ github.sha }}
       EVENT_PATH: ${{ github.event_path }}
       REVERT_PR_NUMBER: ${{ needs.detect-and-revert.outputs.revert_pr_number }}
       REVERT_MERGE_METHOD: ${{ vars.REVERT_MERGE_METHOD || 'merge' }}
+      TOUCHES_WORKFLOWS: ${{ needs.detect-and-revert.outputs.touches_workflows }}
     steps:
       - name: Merge revert PR (after approval)
         run: |
@@ -148,6 +179,10 @@ jobs:
       - name: Create reapply PR (cherry-pick direct push commits)
         run: |
           set -euo pipefail
+          if [ "${TOUCHES_WORKFLOWS}" = "true" ] && [ -z "${ADMIN_PAT:-}" ]; then
+            echo "Reapply would touch .github/workflows/. Set ADMIN_PAT with repo+workflow scopes."
+            exit 1
+          fi
           commits=$(jq -r '.commits | .[].id' "$EVENT_PATH")
           if [ -z "${commits}" ]; then
             echo "No commits found in event payload; nothing to reapply."
