@@ -208,11 +208,10 @@ jobs:
           echo "revert_branch=$revert_branch" >> $GITHUB_OUTPUT
           echo "touches_workflows=$touches_workflows" >> $GITHUB_OUTPUT
 
-    approve-and-reapply:
+  approve-and-reapply:
     needs: detect-and-revert
     if: ${{ needs.detect-and-revert.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
-    environment: revert-approval
     env:
       REPO: ${{ github.repository }}
       EVENT_PATH: ${{ github.event_path }}
@@ -222,7 +221,7 @@ jobs:
       REVERT_BRANCH: ${{ needs.detect-and-revert.outputs.revert_branch }}
       TOUCHES_WORKFLOWS: ${{ needs.detect-and-revert.outputs.touches_workflows }}
     steps:
-      - name: Wait-for-approval / Merge revert PR
+      - name: Merge revert PR
         run: |
           set -euo pipefail
           if [ -z "${REVERT_PR_NUMBER}" ]; then
@@ -288,7 +287,7 @@ jobs:
           git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
           title="Apply direct push ${SHORT_SHA} via PR"
-          body="This PR re-applies commits that were pushed directly to main. It was created automatically after the revert was approved and merged.\n\nOriginal direct push SHA: ${GITHUB_SHA}"
+          body="This PR re-applies commits that were pushed directly to main. It was created automatically after the revert PR was merged.\n\nOriginal direct push SHA: ${GITHUB_SHA}"
 
           create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
             "${GITHUB_API}/repos/${REPO}/pulls" \
