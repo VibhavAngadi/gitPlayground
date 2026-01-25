@@ -144,7 +144,6 @@ jobs:
     needs: detect-and-revert
     if: ${{ needs.detect-and-revert.outputs.should_run == 'true' }}
     runs-on: ubuntu-latest
-    environment: revert-approval
     env:
       GITHUB_TOKEN: ${{ github.token }}
       ADMIN_PAT: ${{ secrets.ADMIN_PAT }}
@@ -156,7 +155,7 @@ jobs:
       REVERT_MERGE_METHOD: ${{ vars.REVERT_MERGE_METHOD || 'merge' }}
       TOUCHES_WORKFLOWS: ${{ needs.detect-and-revert.outputs.touches_workflows }}
     steps:
-      - name: Merge revert PR (after approval)
+      - name: Merge revert PR
         run: |
           set -euo pipefail
           if [ -z "${REVERT_PR_NUMBER}" ]; then
