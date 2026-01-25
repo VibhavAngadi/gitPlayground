@@ -25,7 +25,6 @@ jobs:
       revert_pr_number: ${{ steps.set_outputs.outputs.revert_pr_number }}
       revert_branch: ${{ steps.set_outputs.outputs.revert_branch }}
       touches_workflows: ${{ steps.set_outputs.outputs.touches_workflows }}
-      associated_pulls: ${{ steps.set_outputs.outputs.associated_pulls }}
     steps:
       - name: "Debug: event & push"
         run: |
@@ -33,10 +32,8 @@ jobs:
           echo "Repository: $REPO"
           echo "Event path: $GITHUB_EVENT_PATH"
           echo "Event type: $GITHUB_EVENT_NAME"
-          echo "Ref: $GITHUB_REF"
           echo "Commits:"
           jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
-          jq '.head_commit' "$GITHUB_EVENT_PATH" || true
 
       - name: Get list of files changed in push
         id: detect_files
@@ -53,49 +50,24 @@ jobs:
             echo "touches_workflows=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Check whether commit(s) are associated with PR(s)
+      - name: Check whether commit is associated with a PR
         id: check_pr
         run: |
           set -euo pipefail
-          # We'll query the commit->pulls endpoint for each commit in the push payload.
-          commits=$(jq -r '.commits | .[].id' "$GITHUB_EVENT_PATH")
-          echo "Checking ${commits} for associated PRs"
-          pulls_json="[]"
-          count=0
-          pull_ids=()
-          pull_summaries=()
-          for c in $commits; do
-            resp=$(curl -s -H "Accept: application/vnd.github+json" \
-              -H "Authorization: token ${{ github.token }}" \
-              "${{ env.GITHUB_API }}/repos/${{ env.REPO }}/commits/${c}/pulls")
-            # merge results
-            if [ "$(echo "$resp" | jq 'length')" -gt 0 ]; then
-              pulls_json=$(jq -s 'add' <(echo "$pulls_json") <(echo "$resp"))
-            fi
-          done
-
-          # Deduplicate by number
-          pulls_unique=$(echo "$pulls_json" | jq 'unique_by(.number)')
-          count=$(echo "$pulls_unique" | jq 'length')
-          echo "Found $count associated pull(s)."
-          echo "$pulls_unique" > pulls.json
-
-          # Build a compact list of numbers/titles to pass later
-          numbers=$(jq -r '.[].number' pulls.json | sort -u | xargs || true)
-          summaries=$(jq -r '.[] | "\(.number): \(.title) (merged_at=\(.merged_at) merged=\(.merged // false) merge_commit_sha=\(.merge_commit_sha))"' pulls.json | sort -u || true)
-
+          resp=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token ${{ github.token }}" \
+            "${{ env.GITHUB_API }}/repos/${{ env.REPO }}/commits/${GITHUB_SHA}/pulls")
+          echo "$resp" > pulls.json
+          count=$(jq 'length' pulls.json)
           echo "pulls_count=$count" >> $GITHUB_OUTPUT
-          echo "pulls_raw<<EOF" >> $GITHUB_OUTPUT
-          jq -c '.' pulls.json >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          echo "pull_numbers=${numbers}" >> $GITHUB_OUTPUT
-          echo "pull_summaries<<EOF" >> $GITHUB_OUTPUT
-          echo "$summaries" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
-      # NOTE: we no longer abort if the push is associated with a PR.
-      # We treat PR-merged commits (merge/squash/rebase) the same as direct pushes:
-      # create a revert PR, merge it, and re-apply commits as a new PR for review.
+      - name: Abort if this push came from a PR merge (or has associated PR)
+        if: ${{ steps.check_pr.outputs.pulls_count != '0' }}
+        id: skip
+        run: |
+          echo "This commit is associated with a PR (merge). Nothing to do."
+          echo "should_run=false" >> $GITHUB_OUTPUT
+          echo "touches_workflows=false" >> $GITHUB_OUTPUT
 
       - name: Prepare auth token (ADMIN_PAT preferred when workflows changed)
         id: auth
@@ -110,8 +82,8 @@ jobs:
           fi
           echo "auth_token=$AUTH" >> $GITHUB_OUTPUT
 
-      - name: Create revert branch & PR (revert incoming push)
-        if: ${{ always() }}
+      - name: Create revert branch & PR (revert direct push)
+        if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
         id: revert
         env:
           AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
@@ -125,6 +97,7 @@ jobs:
 
           # If workflows were touched but token lacks workflow scope, exit so human can set ADMIN_PAT
           if echo "$files" | grep -q '^\.github/workflows/'; then
+            # We check whether the provided token is the default GITHUB_TOKEN by comparing to empty ADMIN_PAT
             if [ -z "${{ secrets.ADMIN_PAT }}" ]; then
               echo "Direct push touched .github/workflows/. A PAT with workflow scope (ADMIN_PAT) is required for operations that modify workflow files."
               echo "should_run=false" >> $GITHUB_OUTPUT
@@ -140,11 +113,11 @@ jobs:
             exit 0
           fi
 
-          echo "Detected push to main (direct or via PR). Will create a revert branch and open a PR."
+          echo "Detected direct push to main (no associated PR). Will create a revert branch and open a PR."
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-          # checkout full repo history using git clone and token for auth
+          # checkout full repo history using actions/checkout equivalent via git clone (explicit token avoids relying on checkout step)
           SHORT_SHA=${GITHUB_SHA::7}
           BRANCH="revert/direct-push-${SHORT_SHA}"
 
@@ -157,10 +130,9 @@ jobs:
 
           for c in $commits; do
             echo "Reverting commit $c"
-            # detect merge commit (multiple parents); note: git rev-list prints commit + parents
+            # merge commits have >1 parent; handle revert of merge commits with -m 1
             parents=$(git rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')
             if [ "$parents" -gt 2 ]; then
-              echo "Commit $c is a merge commit; reverting with -m 1"
               git revert --no-edit -m 1 "$c"
             else
               git revert --no-edit "$c"
@@ -170,16 +142,8 @@ jobs:
           # push revert branch
           git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
-          # Compose PR body including any associated PR info (if present)
-          pull_numbers=$(echo "${{ steps.check_pr.outputs.pull_numbers }}" || true)
-          pull_summaries=$(echo "${{ steps.check_pr.outputs.pull_summaries }}" || true)
-
           title="Revert direct push ${SHORT_SHA} to main"
-          body="Automated revert PR: created because commits were pushed to main (directly or via PR) and must be re-applied through a reviewable PR.\n\nDirect push SHA: ${GITHUB_SHA}\n\n"
-          if [ -n "$pull_numbers" ]; then
-            body="${body}Associated pull(s): ${pull_numbers}\n\nDetails:\n${pull_summaries}\n\n"
-          fi
-          body="${body}Please review & merge to restore repository state."
+          body="Automated revert PR: created because commits were pushed directly to main without a PR.\n\nDirect push SHA: ${GITHUB_SHA}\n\nPlease review & merge to restore repository state."
 
           create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
             "${GITHUB_API}/repos/${REPO}/pulls" \
@@ -208,28 +172,39 @@ jobs:
       - name: Ensure stable job outputs (aggregator)
         id: set_outputs
         run: |
-          # Default values
+          # Default values (in case earlier steps didn't run)
           should_run=false
           revert_pr_number=
           revert_branch=
           touches_workflows=false
-          associated_pulls=
 
-          # Read from potential step outputs
+          # If revert step ran and wrote outputs to $GITHUB_OUTPUT, those environment variables are available
+          # Read any values we already exported earlier (GITHUB_OUTPUT variables are mapped to step outputs above)
+          # Use the existing step outputs that may have been set above (GitHub maps them into step outputs when using "echo ... >> $GITHUB_OUTPUT")
+          # We query actions step outputs via environment variables exposed to later steps in the same job.
+          # Fallback: inspect file-based outputs (not always available), but we keep robust defaults.
+
+          # Try to read from the revert step output file (if created)
+          if [ -f "${RUNNER_TEMP}/_github_workflow_revert_output" ]; then
+            echo "found temp revert output"
+          fi
+
+          # Instead, rely on previously echoed $GITHUB_OUTPUT (GitHub makes them available as step outputs in this job)
+          # Read possible step outputs (they exist if the steps ran)
           if [ -n "${{ steps.revert.outputs.should_run || '' }}" ]; then
             should_run="${{ steps.revert.outputs.should_run }}"
+          elif [ -n "${{ steps.skip.outputs.should_run || '' }}" ]; then
+            should_run="${{ steps.skip.outputs.should_run }}"
           fi
 
           revert_pr_number="${{ steps.revert.outputs.revert_pr_number || '' }}"
           revert_branch="${{ steps.revert.outputs.revert_branch || '' }}"
           touches_workflows="${{ steps.revert.outputs.touches_workflows || steps.detect_files.outputs.touches_workflows || 'false' }}"
-          associated_pulls="${{ steps.check_pr.outputs.pull_numbers || '' }}"
 
           echo "should_run=$should_run" >> $GITHUB_OUTPUT
           echo "revert_pr_number=$revert_pr_number" >> $GITHUB_OUTPUT
           echo "revert_branch=$revert_branch" >> $GITHUB_OUTPUT
           echo "touches_workflows=$touches_workflows" >> $GITHUB_OUTPUT
-          echo "associated_pulls=$associated_pulls" >> $GITHUB_OUTPUT
 
   approve-and-reapply:
     needs: detect-and-revert
@@ -262,7 +237,7 @@ jobs:
             echo "Automatic merge of revert PR failed or requires human approval. Response:"
             echo "$resp" | jq .
             echo "Please have a maintainer approve & merge PR #${REVERT_PR_NUMBER} (branch: ${REVERT_BRANCH})."
-            # Exit non-zero so workflow shows a failure requiring human intervention
+            # We do not exit with error here because we still want humans to merge and then the next step could be run manually.
             exit 1
           fi
 
@@ -300,7 +275,6 @@ jobs:
             echo "Cherry-picking commit $c"
             parents=$(git rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')
             if [ "$parents" -gt 2 ]; then
-              echo "Commit $c is a merge commit; cherry-picking with -m 1"
               git cherry-pick -m 1 "$c"
             else
               git cherry-pick "$c"
@@ -310,7 +284,7 @@ jobs:
           git push "https://x-access-token:${AUTH_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
 
           title="Apply direct push ${SHORT_SHA} via PR"
-          body="This PR re-applies commits that were pushed to main (directly or via PR). It was created automatically after the revert PR was merged.\n\nOriginal push SHA: ${GITHUB_SHA}"
+          body="This PR re-applies commits that were pushed directly to main. It was created automatically after the revert PR was merged.\n\nOriginal direct push SHA: ${GITHUB_SHA}"
 
           create_resp=$(curl -s -X POST -H "Authorization: token ${AUTH_TOKEN}" -H "Accept: application/vnd.github+json" \
             "${GITHUB_API}/repos/${REPO}/pulls" \
