@@ -15,6 +15,7 @@ permissions:
 
 env:
   REPO: ${{ github.repository }}
+  EVENT_PATH: ${{ github.event_path }}
   GITHUB_API: https://api.github.com
 
 jobs:
@@ -26,21 +27,21 @@ jobs:
       revert_branch: ${{ steps.set_outputs.outputs.revert_branch }}
       touches_workflows: ${{ steps.set_outputs.outputs.touches_workflows }}
     steps:
-      - name: "Debug: event & push"
+      - name: "Debug: event & push "
         run: |
           echo "PUSH SHA: $GITHUB_SHA"
           echo "Repository: $REPO"
-          echo "Event path: $GITHUB_EVENT_PATH"
+          echo "Event path: $EVENT_PATH"
           echo "Event type: $GITHUB_EVENT_NAME"
           echo "Commits:"
-          jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
+          jq -r '.commits[]? | "\(.id) \(.message)"' "$EVENT_PATH" || true
 
       - name: Get list of files changed in push
         id: detect_files
         run: |
           set -euo pipefail
           # Collect changed files across all commits
-          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$GITHUB_EVENT_PATH" 2>/dev/null | sort -u || true)
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$EVENT_PATH" 2>/dev/null | sort -u || true)
           echo "FILES<<EOF" >> $GITHUB_OUTPUT
           echo "$files" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
@@ -88,12 +89,13 @@ jobs:
         env:
           AUTH_TOKEN: ${{ steps.auth.outputs.auth_token }}
           REPO: ${{ env.REPO }}
+          EVENT_PATH: ${{ env.EVENT_PATH }}
           GITHUB_API: ${{ env.GITHUB_API }}
         run: |
           set -euo pipefail
 
           # Find changed files again (safer than relying on job output interpolation)
-          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$GITHUB_EVENT_PATH" 2>/dev/null | sort -u || true)
+          files=$(jq -r '.commits[]? | (.added[]?, .modified[]?, .removed[]?)' "$EVENT_PATH" 2>/dev/null | sort -u || true)
 
           # If workflows were touched but token lacks workflow scope, exit so human can set ADMIN_PAT
           if echo "$files" | grep -q '^\.github/workflows/'; then
@@ -106,7 +108,7 @@ jobs:
           fi
 
           # Load commits in reverse order (newest first) so git revert succeeds without conflicts
-          commits=$(jq -r '.commits | reverse | .[].id' "$GITHUB_EVENT_PATH")
+          commits=$(jq -r '.commits | reverse | .[].id' "$EVENT_PATH")
           if [ -z "$commits" ]; then
             echo "No commits found in event payload; nothing to revert."
             echo "should_run=false" >> $GITHUB_OUTPUT
@@ -212,6 +214,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPO: ${{ github.repository }}
+      EVENT_PATH: ${{ github.event_path }}
       GITHUB_API: https://api.github.com
       AUTH_TOKEN: ${{ secrets.ADMIN_PAT || github.token }}
       REVERT_PR_NUMBER: ${{ needs.detect-and-revert.outputs.revert_pr_number }}
@@ -250,7 +253,7 @@ jobs:
             exit 1
           fi
 
-          commits=$(jq -r '.commits | .[].id' "$GITHUB_EVENT_PATH")
+          commits=$(jq -r '.commits | .[].id' "$EVENT_PATH")
           if [ -z "${commits}" ]; then
             echo "No commits found in event payload; nothing to reapply."
             exit 0
