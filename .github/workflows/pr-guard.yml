@@ -1,0 +1,89 @@
+name: pr-guard
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  pull-requests: read
+  issues: write
+
+jobs:
+  validate:
+    name: pr-guard
+    runs-on: ubuntu-latest
+    env:
+      # Configure via repo/org variables (Settings → Variables → Actions).
+      REQUIRED_APPROVALS: ${{ vars.REQUIRED_APPROVALS || '1' }}          # minimum approvals required
+      REQUIRED_REVIEWERS: ${{ vars.REQUIRED_REVIEWERS || '' }}           # comma-separated GitHub logins; if empty, not enforced
+      REQUIRED_REVIEWERS_MODE: ${{ vars.REQUIRED_REVIEWERS_MODE || 'all' }} # "all" or "any"
+    steps:
+      - name: Validate approvals and required reviewers
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const requiredApprovals = parseInt(process.env.REQUIRED_APPROVALS || "1", 10);
+            const requiredReviewers = (process.env.REQUIRED_REVIEWERS || "")
+              .split(",")
+              .map(x => x.trim())
+              .filter(Boolean);
+            const requiredReviewersMode = (process.env.REQUIRED_REVIEWERS_MODE || "all").toLowerCase();
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed("No pull_request found in event payload.");
+              return;
+            }
+            const prNumber = pr.number;
+
+            // get all reviews
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+
+            // collect latest state per reviewer (ignore duplicates)
+            const latestByUser = {};
+            for (const r of reviews) {
+              if (!r.user || !r.user.login) continue;
+              latestByUser[r.user.login] = r;
+            }
+            const approvals = Object.values(latestByUser)
+              .filter(r => r.state === "APPROVED")
+              .map(r => r.user.login);
+            const approvalCount = approvals.length;
+
+            const failReasons = [];
+
+            if (approvalCount < requiredApprovals) {
+              failReasons.push(`Need ${requiredApprovals} approving review(s) but found ${approvalCount}.`);
+            }
+
+            if (requiredReviewers.length > 0) {
+              const approvedRequired = requiredReviewers.filter(x => approvals.includes(x));
+              if (requiredReviewersMode === "any") {
+                if (approvedRequired.length === 0) {
+                  failReasons.push(`At least one of required reviewer(s) [${requiredReviewers.join(", ")}] must approve.`);
+                }
+              } else {
+                const missing = requiredReviewers.filter(x => !approvals.includes(x));
+                if (missing.length > 0) {
+                  failReasons.push(`Missing approval(s) from required reviewer(s): ${missing.join(", ")}.`);
+                }
+              }
+            }
+
+            if (failReasons.length > 0) {
+              const body = `❌ PR guard failed:\n\n- ${failReasons.join("\n- ")}\n\nPlease address and re-request review.`;
+              try {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber, body
+                });
+              } catch (err) {
+                console.log(`Failed to create comment: ${err.message}`);
+              }
+              core.setFailed(failReasons.join(" | "));
+            } else {
+              console.log("PR guard passed");
+            }

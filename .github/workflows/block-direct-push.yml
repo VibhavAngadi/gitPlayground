@@ -1,0 +1,93 @@
+name: block-direct-push
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  detect-and-revert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect event
+        run: |
+          echo "PUSH SHA: $GITHUB_SHA"
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Event path: $GITHUB_EVENT_PATH"
+          echo "Commits:"
+          jq -r '.commits[]? | "\(.id) \(.message)"' "$GITHUB_EVENT_PATH" || true
+
+      - name: Check whether commit is associated with a PR
+        id: check_pr
+        run: |
+          # Query the "pulls associated with commit" endpoint
+          resp=$(curl -s -H "Accept: application/vnd.github+json" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls")
+          echo "$resp" > pulls.json
+          count=$(jq 'length' pulls.json)
+          echo "pulls_count=$count" >> $GITHUB_OUTPUT
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Abort if this push came from a PR merge (or has associated PR)
+        if: ${{ steps.check_pr.outputs.pulls_count != '0' }}
+        run: |
+          echo "This commit is associated with a PR (merge). Nothing to do."
+      
+      - name: Revert direct push (create revert branch and open revert PR)
+        if: ${{ steps.check_pr.outputs.pulls_count == '0' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHORT_SHA: ${{ github.sha }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set -euo pipefail
+          # load commits from push event (the event payload has `.commits[]`)
+          commits=$(jq -r '.commits[]?.id' "$EVENT_PATH")
+          if [ -z "${commits}" ]; then
+            echo "No commits found in event payload; nothing to revert."
+            exit 0
+          fi
+
+          echo "Detected direct push to main (no associated PR). Will create a revert branch and open a PR."
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+          # clone full history
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" repo
+          cd repo
+          git fetch --all
+          git checkout main
+
+          BRANCH="revert/direct-push-${SHORT_SHA::7}"
+          git checkout -b "$BRANCH"
+
+          # revert each commit in order (oldest->newest)
+          for c in $commits; do
+            echo "Reverting commit $c"
+            # If a commit fails to revert cleanly we stop so human can inspect
+            parents=$(git rev-list --parents -n 1 "$c" | wc -w | tr -d ' ')
+            if [ "$parents" -gt 2 ]; then
+              git revert --no-edit -m 1 "$c"
+            else
+              git revert --no-edit "$c"
+            fi
+          done
+
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" "HEAD:refs/heads/${BRANCH}"
+
+          # Create PR via API
+          title="Revert direct push ${SHORT_SHA::7} to main"
+          body="Automated revert PR: this was created because commits were pushed directly to main without a PR. Please review & merge to restore repository state.\n\nDirect push SHA: ${SHORT_SHA}\n\n(If this was a mistaken revert, please investigate.)"
+
+          create_resp=$(curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/pulls" \
+            -d "$(jq -n --arg t "$title" --arg b "$body" --arg h "$BRANCH" '{title:$t, head:$h, base:"main", body:$b}')")
+
+          echo "Create PR response:"
+          echo "$create_resp" | jq .
