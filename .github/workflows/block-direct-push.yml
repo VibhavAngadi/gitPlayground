@@ -48,8 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           # load commits from push event (the event payload has `.commits[]`)
-          # Revert newest -> oldest to avoid conflicts when commits touch same lines
-          commits=$(jq -r '.commits | reverse | .[].id' "$EVENT_PATH")
+          commits=$(jq -r '.commits[]?.id' "$EVENT_PATH")
           if [ -z "${commits}" ]; then
             echo "No commits found in event payload; nothing to revert."
             exit 0
